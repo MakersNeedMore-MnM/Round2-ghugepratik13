@@ -1,8 +1,11 @@
 import uuid
+import logging
 from datetime import datetime, timezone, timedelta
 from typing import List, Optional, Dict, Any, Tuple
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, update, and_, func
+
+logger = logging.getLogger("hqms.queue")
 
 from app.models import (
     Queue,
@@ -93,6 +96,9 @@ class QueueDomainService:
 
         # Recalculate ETAs
         await self.recalculate_queue_metrics(queue_id)
+
+        # Dispatch Token Created SMS to patient
+        await self._send_patient_sms(token, "TOKEN_CREATED")
         return token
 
     async def call_next(
@@ -166,6 +172,9 @@ class QueueDomainService:
         )
 
         await self.recalculate_queue_metrics(queue_id)
+
+        # Dispatch Token Called SMS to patient
+        await self._send_patient_sms(next_token, "TOKEN_CALLED")
         return next_token
 
     async def mark_serving(
@@ -591,4 +600,58 @@ class QueueDomainService:
             event_type=event_type.value,
             public_data=public_data,
         )
+
+    async def _send_patient_sms(self, token: Optional[QueueToken], event_type: str) -> None:
+        """Asynchronously formats and sends real-time SMS notification to patient."""
+        if not token or not token.patient_id:
+            return
+
+        try:
+            from app.domain.notifications.engine import NotificationEngine
+            from app.models.patient import Patient
+            from app.models.hospital import Department, Room
+            from app.models.user import StaffUser
+            from app.core.config import settings
+
+            patient = await self.db.scalar(select(Patient).where(Patient.id == token.patient_id))
+            if not patient or not patient.phone_number:
+                return
+
+            queue = await self.db.scalar(select(Queue).where(Queue.id == token.queue_id))
+            dept_name = "General OPD"
+            room_name = "Doctor Cabin"
+            doctor_name = "Doctor"
+
+            if queue:
+                if queue.department_id:
+                    dept = await self.db.scalar(select(Department).where(Department.id == queue.department_id))
+                    if dept:
+                        dept_name = dept.name
+                if queue.room_id:
+                    room = await self.db.scalar(select(Room).where(Room.id == queue.room_id))
+                    if room:
+                        room_name = f"Room {room.room_number}" if room.room_number else room.name
+                if queue.doctor_user_id:
+                    doc = await self.db.scalar(select(StaffUser).where(StaffUser.id == queue.doctor_user_id))
+                    if doc:
+                        doctor_name = doc.full_name
+
+            live_url = f"{settings.FRONTEND_URL}/q/{token.public_tracking_id}"
+            context = {
+                "token_display_number": token.token_display_number,
+                "department_name": dept_name,
+                "room_number": room_name,
+                "doctor_name": doctor_name,
+                "live_url": live_url,
+                "patients_ahead": max(0, (token.operational_position or 1) - 1),
+            }
+
+            engine = NotificationEngine()
+            await engine.dispatch_event_notification(
+                phone_number=patient.phone_number,
+                event_type=event_type,
+                context=context,
+            )
+        except Exception as e:
+            logger.error(f"[SMS Dispatch Error] Failed to send {event_type} SMS for token {token.id}: {e}")
 

@@ -50,6 +50,21 @@ async function request<T>(endpoint: string, options: RequestInit = {}): Promise<
       // Ignored
     }
     const message = errorData?.detail || `HTTP Error ${response.status}: ${response.statusText}`;
+
+    // Auto-clear stale/invalid tokens on 401 to prevent permanent lockout
+    if (response.status === 401 && typeof window !== "undefined") {
+      const isAuthPage = window.location.pathname.includes("/login");
+      if (!isAuthPage) {
+        localStorage.removeItem("hqms_staff_token");
+        localStorage.removeItem("hqms_user_role");
+        localStorage.removeItem("hqms_user");
+        const redirectUrl = window.location.pathname.includes("/admin/hospitals")
+          ? "/platform-control/login"
+          : "/login";
+        window.location.href = redirectUrl;
+      }
+    }
+
     throw new ApiError(response.status, message, errorData);
   }
 
